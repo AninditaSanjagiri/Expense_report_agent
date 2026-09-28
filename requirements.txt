@@ -1,0 +1,16 @@
+# --- Core agent framework -------------------------------------------------
+langgraph>=0.2.28          # StateGraph / START / END / add_conditional_edges
+langchain-core>=0.3.0      # SystemMessage primitive
+langchain-groq>=0.2.0      # ChatGroq wrapper (Groq's fast Llama-3.3 inference)
+
+# --- UI ---------------------------------------------------------------------
+streamlit>=1.38.0
+
+# --- PDF generation -----------------------------------------------------
+fpdf2>=2.7.9                # maintained fork of the original fpdf; imported as `fpdf`
+
+# --- Utilities -----------------------------------------------------------
+python-dotenv>=1.0.0        # loads GROQ_API_KEY / SENDER_EMAIL / etc. from .env
+
+# Note: smtplib and email.mime (used for sending the report) are part of
+# the Python standard library, so they need no entry here.
