@@ -58,7 +58,7 @@ START → Data Retriever → Categorizer & Calculator ──(no missing data)─
 The demo is guaranteed to hit the Anomaly Handler branch by default: the
 mock "Taj Hotels" receipt for Aditi Sharma / July 2026 has `amount: None`.
 
-## Viva cheat sheet — key design decisions
+##key design decisions
 
 - **`StateGraph(ExpenseState)`** — an explicit, inspectable directed graph
   over a typed state object, instead of an opaque `AgentExecutor` loop.
