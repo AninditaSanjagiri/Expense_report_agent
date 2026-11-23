@@ -1,95 +1,43 @@
 """
 app.py
 ------
-Streamlit dashboard for the Autonomous Expense Report Agent.
+Streamlit front-end for the Autonomous Expense Report Agent (Jury 2 edition).
 
-Layout:
-  - Top row: 3 columns of inputs — Employee Name, Target Month, Receiver
-    Email — followed by a full-width "Run Expense Agent" button.
-  - Main area, 2 columns:
-      Left  — live, step-by-step "Thought Trace" as the graph executes.
-      Right — the final Markdown report, a PDF download button, and the
-              email delivery status.
+Three sections, chosen with the navigation buttons under the top bar:
+  📊 Dashboard         - KPI cards, category chart, status indicators, records
+  💬 Chat Assistant    - Unit III: conversational assistant + session memory,
+                         with the Unit IV agent-collaboration panel beside it
+  📄 Expense Report    - the ORIGINAL workflow: live thought trace (left) and
+                         final Markdown report (right), via
+                         `.stream(stream_mode="updates")`
 
-Dark theme is set declaratively in `.streamlit/config.toml` (the officially
-supported way to theme a Streamlit app) rather than injected via custom CSS.
-
-Why `.stream(..., stream_mode="updates")` instead of `.invoke()`:
-`.invoke()` blocks until the ENTIRE graph finishes and only returns the
-final state — the UI would just show one spinner with no visibility into
-which node is running. `.stream(stream_mode="updates")` yields a
-`{node_name: partial_state_update}` dict after EACH node finishes, which is
-what lets us render the trace node-by-node in near real time.
+Nothing is emailed automatically: sending always needs an explicit confirm.
 """
 
 import os
 from datetime import date
+from html import escape
 
+import pandas as pd
 import streamlit as st
-from expense_agent import expense_graph
 
-st.set_page_config(
-    page_title="Autonomous Expense Report Agent",
-    page_icon="🧾",
-    layout="wide",
-)
+import analysis_agent
+from chat_assistant import new_session, sync_context, chat_turn, email_button
+from expense_agent import expense_graph, make_initial_state
+from tools import get_mock_expenses, get_available_months
+from ui_style import CSS, BLUE, TEAL, AMBER, GREEN, metric_card, badge
 
-st.title("🧾 Autonomous Expense Report Agent")
-st.caption(
-    "A LangGraph agent that retrieves receipts, categorizes and totals "
-    "them, flags missing data for human review, then generates and emails "
-    "a PDF expense report."
-)
+st.set_page_config(page_title="Expense Agent · Enterprise", page_icon="🧾", layout="wide")
+st.markdown(CSS, unsafe_allow_html=True)
 
-if not os.getenv("GROQ_API_KEY"):
-    st.warning(
-        "⚠️ GROQ_API_KEY not found. Copy `.env.example` to `.env` and add "
-        "your free Groq key before running the agent.",
-        icon="⚠️",
-    )
-
-# ---------------------------------------------------------------------------
-# TOP ROW — 3-column inputs
-# ---------------------------------------------------------------------------
-input_col1, input_col2, input_col3 = st.columns(3)
-
-with input_col1:
-    employee_name = st.text_input("Employee Name", value="Aditi Sharma")
-
-with input_col2:
-    # A date_input is friendlier than free-text; we only use it to derive
-    # a "YYYY-MM" string, since that's the exact format the mock DB's
-    # `date` field is filtered against in tools.get_mock_expenses.
-    target_month_date = st.date_input("Target Month", value=date(2026, 7, 1))
-
-with input_col3:
-    receiver_email = st.text_input(
-        "Receiver Email (Finance)",
-        value=os.getenv("RECEIVER_EMAIL", "finance@example.com"),
-    )
-
-target_month = target_month_date.strftime("%Y-%m")
-
-run_clicked = st.button(
-    "🚀 Run Expense Agent", type="primary", use_container_width=True
-)
-
-st.divider()
-
-# ---------------------------------------------------------------------------
-# MAIN AREA — 2 columns
-# ---------------------------------------------------------------------------
-left_col, right_col = st.columns([1, 1.3])
-
-with left_col:
-    st.subheader("🧠 Live Thought Trace")
-    trace_container = st.container(border=True)
-
-with right_col:
-    st.subheader("📋 Final Report")
-    result_container = st.container(border=True)
-
-# Human-readable headers for each node, used only for the trace display.
+PAGES = ["📊 Dashboard", "💬 Chat Assistant", "📄 Expense Report"]
+SAMPLE_PROMPTS = [
+    "Generate my travel expense report for July.",
+    "Which expenses are missing amounts or supporting information?",
+    "Break down my travel spending by category.",
+    "Prepare the report for the finance team.",
+]
+# Human-readable headers for each node of the ORIGINAL graph (trace display only).
 NODE_LABELS = {
     "data_retriever": "Node 1 · Data Retriever",
     "categorizer_calculator": "Node 2 · Categorizer & Calculator",
@@ -97,85 +45,290 @@ NODE_LABELS = {
     "compiler_delivery": "Node 4 · Compiler & Delivery",
 }
 
-if run_clicked:
-    if not employee_name.strip() or not receiver_email.strip():
-        st.error("Please fill in the employee name and receiver email.")
-        st.stop()
 
-    # The initial state fed into START. Every ExpenseState key the graph
-    # will ever read/write should have a sane starting value here.
-    initial_state = {
-        "employee_name": employee_name,
-        "target_month": target_month,
-        "receiver_email": receiver_email,
-        "raw_expenses": [],
-        "valid_expenses": [],
-        "missing_expenses": [],
-        "categorized_expenses": [],
-        "category_totals": {},
-        "grand_total": 0.0,
-        "has_missing_data": False,
-        "discrepancy_note": "",
-        "final_report_md": "",
-        "pdf_path": "",
-        "email_status": {},
-        "thought_trace": [],
-    }
+def rs(x: float) -> str:
+    return f"₹{x:,.2f}"
 
-    # `accumulated_state` mirrors LangGraph's own internal state merging:
-    # start from initial_state, then merge each node's partial-update dict
-    # on top of it, key by key. This lets the right-hand column read
-    # `final_report_md` / `pdf_path` once Compiler & Delivery has run,
-    # without invoking the graph a second time.
-    accumulated_state = dict(initial_state)
 
-    with trace_container:
-        trace_placeholder = st.empty()
-    displayed_trace_lines = []
+# ---------------------------------------------------------------------------
+# HERO + TOP CONTROL BAR
+# ---------------------------------------------------------------------------
+has_key = bool(os.getenv("GROQ_API_KEY"))
+demo_now = st.session_state.get("demo_toggle", not has_key)
+mode_badge = badge("● Demo mode · offline", "teal") if demo_now else badge("● Live mode · Groq LLM", "ok")
+st.markdown(
+    f'<div class="hero"><div><h1>🧾 Autonomous Expense Report Agent</h1>'
+    f'<p>Retrieve · categorize · flag missing data · generate a PDF · email finance - with a conversational '
+    f'assistant and a dedicated analysis agent.</p></div><div>{mode_badge}</div></div>',
+    unsafe_allow_html=True,
+)
 
-    with st.spinner("Agents are working..."):
-        # stream_mode="updates" -> each `step` is {node_name: node_output}
-        # for whichever node just finished running.
-        for step in expense_graph.stream(initial_state, stream_mode="updates"):
-            for node_name, node_output in step.items():
-                header = NODE_LABELS.get(node_name, node_name)
+c1, c2, c3, c4 = st.columns([1.2, 1, 1.5, 1.1], gap="medium")
+employee = c1.text_input("Employee name", value="Aditi Sharma")
+month_date = c2.date_input("Target month", value=date(2026, 7, 1))
+receiver = c3.text_input("Finance email (receiver)", value=os.getenv("RECEIVER_EMAIL", "finance@example.com"))
+with c4:
+    st.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
+    demo = st.toggle("Demo mode (offline)", value=not has_key, key="demo_toggle",
+                     help="Offline rule-based assistant, keyword categorizer, simulated email. "
+                          "Turn off to use the Groq LLM (needs GROQ_API_KEY).")
+if not demo and not has_key:
+    st.warning("Live mode needs GROQ_API_KEY in your .env file - switch Demo mode on to run offline.")
 
-                for line in node_output.get("thought_trace", []):
-                    displayed_trace_lines.append(f"**{header}**\n\n{line}")
+month = month_date.strftime("%Y-%m")
 
-                for key, value in node_output.items():
-                    if key != "thought_trace":
-                        accumulated_state[key] = value
+# ---------------------------------------------------------------------------
+# SESSION MEMORY (lives in st.session_state for the whole browser session)
+# ---------------------------------------------------------------------------
+if "chat" not in st.session_state:
+    st.session_state.chat = new_session(employee, month, receiver, demo)
+    st.session_state.display = []      # chat bubbles shown on screen: {"role", "text"}
+    st.session_state.page = PAGES[0]
+session = st.session_state.chat
+sync_context(session, employee, month, receiver, demo)
 
-            trace_placeholder.markdown("\n\n---\n\n".join(displayed_trace_lines))
+# ---------------------------------------------------------------------------
+# NAVIGATION
+# ---------------------------------------------------------------------------
+def go(page: str):
+    st.session_state.page = page
 
-    with result_container:
-        if accumulated_state.get("final_report_md"):
-            st.markdown(accumulated_state["final_report_md"])
 
-            pdf_path = accumulated_state.get("pdf_path")
-            if pdf_path and os.path.exists(pdf_path):
-                with open(pdf_path, "rb") as f:
-                    st.download_button(
-                        "⬇️ Download PDF Report",
-                        data=f.read(),
-                        file_name=os.path.basename(pdf_path),
-                        mime="application/pdf",
-                        use_container_width=True,
-                    )
+st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
+for col, name in zip(st.columns(3, gap="medium"), PAGES):
+    col.button(name, key=f"nav_{name}", on_click=go, args=(name,),
+               type="primary" if st.session_state.page == name else "secondary")
+st.markdown("<div style='height:.8rem'></div>", unsafe_allow_html=True)
 
-            email_status = accumulated_state.get("email_status", {})
-            if email_status.get("success"):
-                st.success(email_status["message"])
-            elif email_status:
-                st.error(email_status["message"])
+
+# ---------------------------------------------------------------------------
+# SHARED HELPERS
+# ---------------------------------------------------------------------------
+def email_status():
+    """(label, badge kind) describing the email state of the current report."""
+    if not session["report"]:
+        return "No report yet", "muted"
+    r = session["email_result"]
+    if r:
+        return {"sent": ("Sent", "ok"), "simulated": ("Simulated · not sent", "info"),
+                "failed": ("Failed", "err")}[r["status"]]
+    return ("Awaiting your confirmation", "warn") if session["awaiting_email"] else ("Not sent", "muted")
+
+
+def email_confirm_box(where: str):
+    """Shown whenever a report is prepared and waiting for the employee's explicit OK."""
+    if not session["awaiting_email"]:
+        return
+    rep = session["report"]
+    st.markdown(
+        f'<div class="panel warn">🔒 <b>Confirmation required</b><br>Send <code>{escape(os.path.basename(rep["pdf_path"]))}</code> '
+        f'to <b>{escape(rep["receiver_email"])}</b>? Nothing is sent until you confirm.</div>',
+        unsafe_allow_html=True)
+
+    def act(confirm: bool):
+        st.session_state.display.append({"role": "assistant", "text": email_button(session, confirm)})
+
+    b1, b2 = st.columns(2)
+    b1.button("✅ Confirm & send email", key=f"confirm_{where}", type="primary", on_click=act, args=(True,))
+    b2.button("Cancel", key=f"cancel_{where}", on_click=act, args=(False,))
+
+
+def dashboard_findings():
+    """Retrieve records + ask the Expense Analysis Agent (cached per employee/month/mode)."""
+    recs = get_mock_expenses(employee, month)
+    cache = st.session_state.setdefault("dash_cache", {})
+    key = (employee, month, demo)
+    if recs and key not in cache:
+        request = {"sender": "Dashboard", "receiver": analysis_agent.NAME, "expenses": recs}
+        cache[key] = analysis_agent.handle(request, use_llm=not demo)["findings"]
+    return recs, cache.get(key)
+
+
+# ===========================================================================
+# PAGE 1 - DASHBOARD
+# ===========================================================================
+def page_dashboard():
+    st.markdown(f'<div class="section-title">Overview · {escape(employee)} · {month}</div>'
+                '<div class="section-sub">Figures are computed in Python by the Expense Analysis Agent.</div>',
+                unsafe_allow_html=True)
+    recs, f = dashboard_findings()
+    if not recs:
+        months = ", ".join(get_available_months(employee)) or "none"
+        st.info(f"No expenses found for {employee} in {month}. Months with data: {months}.")
+        return
+
+    flagged = len(f["flagged_expenses"])
+    top = f["highest_category"]
+    k1, k2, k3, k4 = st.columns(4, gap="medium")
+    k1.markdown(metric_card("Total spend", rs(f["total_amount"]), "excludes receipts with no amount", BLUE),
+                unsafe_allow_html=True)
+    k2.markdown(metric_card("Expenses", str(f["total_expenses"]), f"{len(f['category_totals'])} categories", TEAL),
+                unsafe_allow_html=True)
+    k3.markdown(metric_card("Missing information", str(flagged),
+                            f"{f['missing_amount_count']} no amount · {f['missing_support_count']} no receipt",
+                            AMBER if flagged else GREEN), unsafe_allow_html=True)
+    k4.markdown(metric_card("Top category", top["name"] if top else "-", rs(top["amount"]) if top else "", TEAL),
+                unsafe_allow_html=True)
+    st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
+
+    left, right = st.columns([3, 2], gap="large")
+    with left:
+        st.markdown('<div class="section-title">Spending by category</div>', unsafe_allow_html=True)
+        chart = pd.DataFrame({"Category": list(f["category_totals"]), "Amount (₹)": list(f["category_totals"].values())})
+        st.bar_chart(chart.set_index("Category"), color=TEAL, height=300)
+    with right:
+        st.markdown('<div class="section-title">Status</div>', unsafe_allow_html=True)
+        rep_badge = badge("Generated", "ok") if session["report"] else badge("Not generated", "muted")
+        miss_badge = badge(f"{flagged} flagged", "warn") if flagged else badge("All complete", "ok")
+        label, kind = email_status()
+        st.markdown(
+            f'<div class="panel"><div class="status-row"><span>📄 Report</span>{rep_badge}</div>'
+            f'<div class="status-row"><span>⚠️ Missing information</span>{miss_badge}</div>'
+            f'<div class="status-row"><span>📧 Email to finance</span>{badge(label, kind)}</div></div>',
+            unsafe_allow_html=True)
+
+    st.markdown('<div class="section-title">Expense records</div>', unsafe_allow_html=True)
+    issues = {(x["date"], x["vendor"]): x["missing"] for x in f["flagged_expenses"]}
+    cat_of = {(i["date"], i["vendor"]): c for c, items in f["items_by_category"].items() for i in items}
+    rows = []
+    for r in recs:
+        miss = issues.get((r["date"], r["vendor"]), [])
+        rows.append({"Date": r["date"], "Vendor": r["vendor"], "Description": r["description"],
+                     "Category": cat_of.get((r["date"], r["vendor"]), "-"),
+                     "Amount": rs(r["amount"]) if r["amount"] is not None else "—",
+                     "Status": "✅ Complete" if not miss else "⚠️ Missing " + ", ".join(
+                         "amount" if m == "amount" else "receipt" for m in miss)})
+    st.dataframe(rows, hide_index=True)
+
+
+# ===========================================================================
+# PAGE 2 - CHAT ASSISTANT (+ agent collaboration panel)
+# ===========================================================================
+def collaboration_panel():
+    st.markdown('<div class="section-title">🤝 Agent Collaboration</div>'
+                '<div class="section-sub">Two agents, two responsibilities.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="agent blue"><b>💬 Chat Assistant</b><br>Talks to the employee, picks the tools, writes the answer.</div>'
+        '<div class="agent teal"><b>🔎 Expense Analysis Agent</b><br>Analyses records: category totals, '
+        'missing information. Returns structured findings.</div>', unsafe_allow_html=True)
+    log = session["collab_log"]
+    if not log:
+        st.info("Ask a question - the exchange between the two agents appears here.")
+        return
+    e = log[-1]
+    f = e["findings"]
+    st.markdown(f'<div class="step"><span>①</span> Assistant → Analysis Agent</div>', unsafe_allow_html=True)
+    if e["reused"]:
+        st.write("Reused the findings already received earlier in this session (session memory) - no new request needed.")
+    else:
+        st.write(f"“Please analyse the {f['total_expenses']} expense records for {session['employee']} ({e['month']}).”")
+    st.markdown('<div class="step"><span>②</span> Analysis Agent → Assistant · findings</div>', unsafe_allow_html=True)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total", rs(f["total_amount"]))
+    m2.metric("Categories", len(f["category_totals"]))
+    m3.metric("Flagged", len(f["flagged_expenses"]))
+    for x in f["flagged_expenses"]:
+        st.write(f"⚠️ **{x['vendor']}** - missing {', '.join(x['missing'])}")
+    with st.expander("Raw findings (JSON)"):
+        st.json(f)
+    st.markdown('<div class="step"><span>③</span> Assistant → Employee</div>', unsafe_allow_html=True)
+    used = e["used"]
+    st.write("Built the reply from: " + ", ".join(f"`{u}`" for u in used) if used
+             else "The LLM read the findings JSON and wrote the reply.")
+    st.caption("Reply preview: " + e["reply"].replace("\n", " ")[:170] + "…")
+
+
+def page_chat():
+    prompt = st.chat_input("Ask about your expenses, e.g. “Generate my travel expense report for July”")
+    prompt = prompt or st.session_state.pop("queued_prompt", None)
+    if prompt:                                          # one chat turn
+        st.session_state.display.append({"role": "user", "text": prompt})
+        with st.spinner("Assistant is working…"):
+            reply = chat_turn(session, prompt)
+        st.session_state.display.append({"role": "assistant", "text": reply})
+
+    left, right = st.columns([3, 2], gap="large")
+    with left:
+        st.markdown('<div class="section-title">💬 Chat Assistant</div>'
+                    '<div class="section-sub">Natural-language access to your expenses. Try a suggestion:</div>',
+                    unsafe_allow_html=True)
+        for pair in (SAMPLE_PROMPTS[:2], SAMPLE_PROMPTS[2:]):
+            for col, text in zip(st.columns(2, gap="small"), pair):
+                col.button(text, key=f"chip_{text}", on_click=lambda t=text: st.session_state.update(queued_prompt=t))
+        with st.container(height=470, border=True):
+            if not st.session_state.display:
+                with st.chat_message("assistant", avatar="🤖"):
+                    st.write(f"Hi {session['employee'].split()[0]}! I can pull your expenses, spot missing "
+                             "information, break down spending and prepare your report. What would you like to do?")
+            for msg in st.session_state.display:
+                with st.chat_message(msg["role"], avatar="🧑‍💼" if msg["role"] == "user" else "🤖"):
+                    st.markdown(msg["text"])
+        email_confirm_box("chat")
+    with right:
+        collaboration_panel()
+
+
+# ===========================================================================
+# PAGE 3 - EXPENSE REPORT (the original workflow)
+# ===========================================================================
+def page_report():
+    st.markdown('<div class="section-title">Expense Report</div>'
+                '<div class="section-sub">Runs the original LangGraph workflow: retrieve → categorize → '
+                '(flag missing data) → compile PDF. Email is never sent automatically.</div>', unsafe_allow_html=True)
+    run_clicked = st.button("🚀 Run Expense Agent", type="primary")
+    left, right = st.columns([1, 1.3], gap="large")
+    with left:
+        st.markdown('<div class="section-title">🧠 Live Thought Trace</div>', unsafe_allow_html=True)
+        trace_box = st.container(border=True)
+    with right:
+        st.markdown('<div class="section-title">📋 Final Report</div>', unsafe_allow_html=True)
+        result_box = st.container(border=True)
+
+    if run_clicked:
+        if not employee.strip() or not receiver.strip():
+            st.error("Please fill in the employee name and receiver email.")
+            st.stop()
+        state = make_initial_state(employee, month, receiver, demo)
+        lines = []
+        with trace_box:
+            placeholder = st.empty()
+        with st.spinner("Agents are working…"):
+            # stream_mode="updates" -> {node_name: partial_update} after EACH node finishes
+            for step in expense_graph.stream(state, stream_mode="updates"):
+                for node_name, node_output in step.items():
+                    header = NODE_LABELS.get(node_name, node_name)
+                    lines += [f"**{header}**\n\n{ln}" for ln in node_output.get("thought_trace", [])]
+                    state.update({k: v for k, v in node_output.items() if k != "thought_trace"})
+                placeholder.markdown("\n\n---\n\n".join(lines))
+        state["thought_trace"] = lines
+        session.update(report=state, awaiting_email=False, email_result=None)
+    else:
+        with trace_box:
+            trace = (session["report"] or {}).get("thought_trace")
+            st.markdown("\n\n---\n\n".join(trace)) if trace else st.info("Click **Run Expense Agent** to begin.")
+
+    with result_box:
+        rep = session["report"]
+        if not rep:
+            st.info("Your finalized expense report will appear here.")
+            return
+        label, kind = email_status()
+        st.markdown(badge("Report generated", "ok") + " &nbsp; " +
+                    (badge("Missing data flagged", "warn") if rep["has_missing_data"] else badge("No missing data", "ok")) +
+                    " &nbsp; " + badge("Email: " + label, kind), unsafe_allow_html=True)
+        st.markdown(rep["final_report_md"])
+        if os.path.exists(rep["pdf_path"]):
+            with open(rep["pdf_path"], "rb") as fh:
+                st.download_button("⬇️ Download PDF report", data=fh.read(),
+                                   file_name=os.path.basename(rep["pdf_path"]), mime="application/pdf")
+        if session["awaiting_email"]:
+            email_confirm_box("report")
+        elif session["email_result"]:
+            r = session["email_result"]
+            {"sent": st.success, "simulated": st.info, "failed": st.error}[r["status"]](r["message"])
         else:
-            st.warning(
-                "The graph finished but no report was produced — check the "
-                "thought trace on the left for details."
-            )
-else:
-    with trace_container:
-        st.info("Fill in the inputs above and click **Run Expense Agent** to begin.")
-    with result_container:
-        st.info("Your finalized expense report will appear here.")
+            st.button("📧 Prepare email to finance", key="prepare_email",
+                      on_click=lambda: session.update(awaiting_email=True))
+
+
+{PAGES[0]: page_dashboard, PAGES[1]: page_chat, PAGES[2]: page_report}[st.session_state.page]()

@@ -1,90 +1,124 @@
-# 🧾 Autonomous Expense Report Agent
+# Autonomous Expense Report Agent — React Edition
 
-A LangGraph agent that retrieves last month's travel receipts, categorizes
-and totals them, flags any receipt missing an amount for human review, then
-generates a real PDF and emails it to finance — all visualized in a
-dark-themed Streamlit dashboard with a live "thought trace."
+A local enterprise-style expense-reporting application with a React UI, FastAPI backend, SQLite persistence, and your existing LangGraph expense-report workflow.
 
-## Project structure
+## What's included
 
-```
-expense-report-agent/
-├── requirements.txt          # pinned dependencies
-├── .env.example                # copy to .env and fill in real values
-├── .streamlit/
-│   └── config.toml              # dark theme (declarative, no CSS hacks)
-├── tools.py                     # mock receipts DB, PDF generator, SMTP sender
-├── expense_agent.py             # TypedDict state, 4 nodes, conditional edge, StateGraph
-├── app.py                        # Streamlit dashboard
-└── README.md
-```
+- React + TypeScript + Vite frontend with Home, Expense Review, Generated Reports, and AI Assistant sections.
+- FastAPI API backend.
+- SQLite database automatically created and seeded with synthetic expense data for multiple employees and months.
+- Reuses the original `expense_agent.py` LangGraph workflow and `analysis_agent.py`.
+- Review/edit missing amounts, receipt IDs, and review notes.
+- PDF generation and persistent report version history.
+- Explicit confirmation before email delivery. Demo mode simulates sending; it does not send real email.
 
-## Setup
+## Requirements
 
-```bash
-pip install -r requirements.txt
-cp .env.example .env
-# edit .env:
-#   GROQ_API_KEY        - free key from https://console.groq.com/keys
-#   SENDER_EMAIL         - a Gmail address
-#   EMAIL_APP_PASSWORD   - a Gmail "App Password" (not your normal password —
-#                          Google Account -> Security -> 2-Step Verification
-#                          -> App Passwords)
-#   RECEIVER_EMAIL       - finance's inbox (also editable in the UI)
-streamlit run app.py
-```
+- Python 3.10+ recommended.
+- Node.js 20+ recommended.
+- A Groq API key is optional for this initial React UI build; database retrieval, Python calculations, synthetic seed data, and Demo mode do not require it.
+- Real email delivery requires configured Gmail SMTP credentials and a finance recipient.
 
-No real database or paid API is used anywhere: receipts come from a
-hardcoded list in `tools.py`, so the demo never depends on network access
-to a database. If `SENDER_EMAIL` / `EMAIL_APP_PASSWORD` aren't set (or the
-send fails for any reason), `send_expense_email` fails gracefully and the
-UI shows why — the app keeps running either way.
+## Windows setup
 
-## Architecture at a glance
+Open two terminals in the project root.
 
-```
-START → Data Retriever → Categorizer & Calculator ──(no missing data)──→ Compiler & Delivery → END
-                                    │
-                                    └──(has_missing_data)──→ Anomaly Handler ──→ Compiler & Delivery → END
+### Terminal 1 — Python backend
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+copy .env.example .env
 ```
 
-| Node | Calls the LLM? | Calls a tool? | Purpose |
-|---|---|---|---|
-| **Data Retriever** | ❌ | ✅ `get_mock_expenses` | Pulls receipts for the employee + month from the mock DB |
-| **Categorizer & Calculator** | ✅ (categorization only) | — | Splits valid vs. missing-amount receipts (Python), categorizes valid ones (LLM), sums totals (Python) |
-| **Anomaly Handler** | ✅ | — | Only runs if `has_missing_data`; drafts a discrepancy note for finance |
-| **Compiler & Delivery** | ❌ | ✅ `generate_pdf`, ✅ `send_expense_email` | Formats the Markdown report, renders the PDF, emails it |
+Open `.env` and fill in credentials only if you want live LLM/email functionality. Do not share the file or commit it to Git.
 
-The demo is guaranteed to hit the Anomaly Handler branch by default: the
-mock "Taj Hotels" receipt for Aditi Sharma / July 2026 has `amount: None`.
+Start the backend:
 
-##key design decisions
+```bat
+python -m uvicorn api:app --reload --host 127.0.0.1 --port 8000
+```
 
-- **`StateGraph(ExpenseState)`** — an explicit, inspectable directed graph
-  over a typed state object, instead of an opaque `AgentExecutor` loop.
-- **`Annotated[List[str], operator.add]`** on `thought_trace` — a
-  *reducer*. Tells LangGraph to concatenate each node's new trace lines
-  onto the list instead of overwriting it.
-- **Missing-data detection is deterministic, not LLM-judged.** In
-  `categorizer_calculator_node`, `has_missing_data` is set by a plain
-  Python check (`amount is None`) — a factual condition should never
-  depend on a probabilistic model "noticing" it.
-- **The LLM only categorizes; Python does the arithmetic.** Category
-  labels (a judgment call) come from the LLM; category totals and the
-  grand total are computed with plain `sum()`. This is a deliberate
-  design choice to avoid trusting an LLM with precise math.
-- **Two independent fallback layers**, both there so a live demo never
-  crashes: `_categorize_with_llm` falls back to `_keyword_categorize` if
-  the LLM call or its JSON parsing fails; `send_expense_email` catches
-  any SMTP/network error and returns a `{"success": False, ...}` dict
-  instead of raising.
-- **`add_conditional_edges`** — `route_after_categorizing` reads
-  `state["has_missing_data"]` at runtime and returns a string key, looked
-  up in a `{key: node_name}` map to pick the next node. This is what
-  makes the Anomaly Handler branch conditional rather than always-on.
-- **`.stream(state, stream_mode="updates")`** — used in `app.py` instead
-  of `.invoke()` so the UI can render each node's output as soon as it's
-  ready, producing the live "thought trace."
-- **Real PDF, real email, both via well-known free tooling** — `fpdf2`
-  (imported as `fpdf`) for the PDF; Python's own `smtplib` +
-  `email.mime` for the email, no third-party mail SDK.
+Check the API at `http://127.0.0.1:8000/api/health` and interactive API docs at `http://127.0.0.1:8000/docs`.
+
+### Terminal 2 — React frontend
+
+```bat
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`.
+
+## Database and synthetic data
+
+
+## Database and synthetic data
+
+On first startup, `database.py` creates `data/expenses.db` and seeds multiple employees with expense records across several months. It includes deliberate missing-amount and missing-receipt cases for testing. These are synthetic records, not live corporate data.
+
+The SQLite database persists between restarts. To reset the sample database, stop the backend, delete `data/expenses.db`, and restart the backend. This deletes local edits and generated report metadata; back up anything you need first.
+
+PDF files are stored in `data/generated_reports/`.
+
+
+The SQLite database persists between restarts. To reset the sample database, stop the backend, delete `data/expenses.db`, and restart the backend. This deletes local edits and generated report metadata; back up anything you need first.
+
+PDF files are stored in `data/generated_reports/`.
+
+## Core workflow
+
+1. Select an employee and reporting month.
+2. The backend retrieves only matching database records.
+3. The analysis agent calculates category totals and identifies missing information.
+4. Review and save corrections in Expense Review.
+5. Generate a PDF. Generation does not email it.
+6. Open Generated Reports to download or send a specific version.
+7. Sending requires an explicit confirmation. Demo mode only simulates delivery.
+
+Reports are versioned; regenerating creates a new version rather than overwriting an existing report.
+
+## Important limitations of this first integration
+
+- The current React chat has a deterministic command router for the key jury-demo requests. It is not yet connected to the full live LLM tool-calling chat graph in `chat_assistant.py`.
+- The current review screen edits amount, receipt/document ID, and review note. It does not yet upload actual receipt files.
+- This is a local prototype with synthetic data. Employee selection is not authentication, so it must not be exposed as a real multi-user enterprise service without server-side identity and authorization.
+- SMTP delivery and live API behavior must be tested with your own credentials before claiming they work. Keep Demo mode on for the jury until real delivery has been verified.
+- `app.py` remains as the previous Streamlit interface and is kept as a fallback; the new React interface is served from `frontend/`.
+
+## Troubleshooting
+
+- If `streamlit` is not recognized, that affects the legacy UI only. For this React app, start the API with `python -m uvicorn ...` and the frontend with `npm run dev`.
+- If the UI says it cannot connect, confirm the backend is running at `http://127.0.0.1:8000`.
+- If port 8000 or 5173 is busy, stop the process using it or change the configured port.
+- If PDF generation fails, check that Python can write to the project `data/generated_reports/` folder.
+
+
+## Live LLM and email setup
+
+Set `GROQ_MODEL=openai/gpt-oss-120b` and `GROQ_API_KEY` in `.env`. The chat endpoint uses the configured Groq model to classify requests and identify the requested employee/month; generation is proposed in chat and requires a confirmation dialog before the PDF is created.
+
+For real email delivery, keep Demo mode unchecked, set `SENDER_EMAIL` and `EMAIL_APP_PASSWORD` to a Gmail sender account and Gmail App Password (requires 2-Step Verification), and verify the recipient in the final confirmation dialog. The default recipient is `anindita.sanjagiri@gmail.com`. The email uses a fixed professional template and attaches the saved PDF. The UI only reports success when SMTP confirms sending; failures are surfaced as failures. Never commit `.env`.
+
+The database seeds synthetic sample data for six employees across nine months on first run. It is a persistent local SQLite database, not a live corporate expense system. Back up `data/expenses.db` before deleting or resetting data.
+
+## Updated chat confirmation behavior
+
+The chat endpoint uses recent conversation turns to recognize an affirmative reply to a pending report-generation confirmation. For example, after asking to generate the May 2026 report and confirming with `yes`, the backend executes the existing LangGraph report workflow, verifies that a PDF was created, persists the report version, and returns `report_generated`. The React client then opens Generated Reports and refreshes the list. A report can be generated with unresolved receipt information; the report remains marked Needs Review. Email delivery is a separate action requiring the email confirmation dialog.
+
+The UI stylesheet includes the Tangerine Studio editorial redesign: larger typography, wider spacing, expressive metric panels, and more spacious chat and dialog layouts.
+
+## Final UI and chat-action update
+
+This revision replaces the former generic hero/metric-card home page with an editorial, illustrated layout: oversized Space Grotesk headings, asymmetrical warm-paper hero, CSS-drawn report artwork, three colorful workflow tiles, a spacious statistics strip, and more deliberate spacing. Operational tables and review dialogs remain accessible, and the palette follows Tangerine Studio (ivory, orange, ink, lavender, mustard).
+
+The chat now keeps a pending report confirmation in React state. When the assistant has proposed a specific employee/month and the user confirms, the frontend calls the existing `/api/reports/generate` Python endpoint directly, then shows the actual result and refreshes report history. A clear cancellation discards the pending action. The API also has a deterministic guard for explicit report-generation requests so a generic missing-information classification cannot override an unambiguous generation request. Python/LangGraph remains responsible for creating the PDF; generation does not send email.
+
+### Important limitations
+
+- Expense records are synthetic demonstration data, not company records.
+- A successful SMTP send requires valid sender credentials and Gmail App Password configuration. Keep credentials in `.env`; never commit the file.
+- Frontend dependency installation and browser end-to-end testing were not completed in the build environment. Run `npm install` and `npm run build` from `frontend/` locally before presenting or deploying the app.

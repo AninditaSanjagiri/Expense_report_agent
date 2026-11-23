@@ -28,7 +28,7 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage
 from langgraph.graph import StateGraph, START, END
 
-from tools import get_mock_expenses, generate_pdf, send_expense_email
+from tools import get_mock_expenses, generate_pdf, send_confirmed_email
 
 # Load GROQ_API_KEY / SENDER_EMAIL / EMAIL_APP_PASSWORD from a local .env
 # file (see .env.example).
@@ -39,9 +39,12 @@ load_dotenv()
 # agent's LLM calls are classification and short factual note-drafting,
 # where we want consistent, low-variance output.
 llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0.2,
-    groq_api_key=os.getenv("GROQ_API_KEY"),
+    model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+    temperature=0,
+    # `or "not-set"`: lets the app start offline in Demo mode. In Demo mode no
+    # LLM call is ever made; in live mode a missing/invalid key simply makes
+    # the call fail, which every caller below already handles.
+    groq_api_key=os.getenv("GROQ_API_KEY") or "not-set",
 )
 
 # Fixed set of categories the LLM is allowed to choose from. Constraining
@@ -80,6 +83,10 @@ class ExpenseState(TypedDict):
     final_report_md: str      # Markdown shown in the Streamlit right column
     pdf_path: str              # path to the generated PDF file
     email_status: dict         # {"success": bool, "message": str}
+
+    # --- Jury 2 additions -------------------------------------------------
+    demo_mode: bool           # True -> no LLM / no real email (offline demo)
+    email_confirmed: bool     # True only after the employee explicitly confirms
 
     thought_trace: Annotated[List[str], operator.add]
 
@@ -136,7 +143,7 @@ def _keyword_categorize(expense: dict) -> dict:
     return tagged
 
 
-def _categorize_with_llm(valid_expenses: list) -> list:
+def _categorize_with_llm(valid_expenses: list, use_llm: bool = True) -> list:
     """
     Helper used by categorizer_calculator_node (not a graph node itself).
     Asks the LLM to assign one of CATEGORY_OPTIONS to each expense, and
@@ -149,6 +156,10 @@ def _categorize_with_llm(valid_expenses: list) -> list:
     """
     if not valid_expenses:
         return []
+
+    # Demo mode: skip the network call entirely and use the keyword rules.
+    if not use_llm:
+        return [_keyword_categorize(e) for e in valid_expenses]
 
     items_desc = "\n".join(
         f"{i}. vendor='{e['vendor']}', description='{e['description']}'"
@@ -214,7 +225,9 @@ def categorizer_calculator_node(state: ExpenseState) -> dict:
     missing_expenses = [e for e in raw_expenses if e.get("amount") is None]
     has_missing_data = len(missing_expenses) > 0
 
-    categorized_expenses = _categorize_with_llm(valid_expenses)
+    categorized_expenses = _categorize_with_llm(
+        valid_expenses, use_llm=not state.get("demo_mode", False)
+    )
 
     category_totals: dict = {}
     for expense in categorized_expenses:
@@ -264,10 +277,19 @@ def anomaly_handler_node(state: ExpenseState) -> dict:
         "invent or guess any amounts."
     )
 
-    response = llm.invoke([SystemMessage(content=system_prompt)])
+    # Demo mode or LLM failure -> a fixed template note (never crash, never invent amounts).
+    note = (
+        "The following receipts have no amount and need manual follow-up before "
+        "reimbursement:\n" + missing_list
+    )
+    if not state.get("demo_mode", False):
+        try:
+            note = llm.invoke([SystemMessage(content=system_prompt)]).content
+        except Exception:  # noqa: BLE001 - keep the template note
+            pass
 
     return {
-        "discrepancy_note": response.content,
+        "discrepancy_note": note,
         "thought_trace": [
             f"🚩 Anomaly Handler: flagged {len(state['missing_expenses'])} "
             "receipt(s) with missing amounts for human review."
@@ -295,8 +317,16 @@ def compiler_delivery_node(state: ExpenseState) -> dict:
         lines.append(f"| {category} | ₹{total:,.2f} |")
     lines.append(f"| **Grand Total** | **₹{state['grand_total']:,.2f}** |")
 
-    if state.get("has_missing_data"):
-        lines += ["", "### ⚠️ Flagged for Review", state["discrepancy_note"]]
+    review_items = []
+    for item in state.get("raw_expenses", []):
+        missing = []
+        if item.get("amount") is None: missing.append("missing amount")
+        if not item.get("receipt_id"): missing.append("missing receipt / supporting document ID")
+        if missing: review_items.append(f"{item.get('vendor', 'Expense')} ({item.get('date', 'date unavailable')}): {', '.join(missing)}")
+    if state.get("has_missing_data") or review_items:
+        note = state.get("discrepancy_note", "")
+        if review_items: note = (note + "\n" if note else "") + "\n".join(review_items)
+        lines += ["", "### ⚠️ Flagged for Review", note or "Supporting information requires review."]
 
     final_report_md = "\n".join(lines)
 
@@ -305,23 +335,30 @@ def compiler_delivery_node(state: ExpenseState) -> dict:
         target_month=state["target_month"],
         category_totals=state["category_totals"],
         grand_total=state["grand_total"],
-        discrepancy_note=state.get("discrepancy_note", ""),
-        output_dir=".",  # Forces the PDF to save in the current project folder
+        discrepancy_note=state.get("discrepancy_note", "") + "\n" + "\n".join(str(r.get("vendor", "Expense")) + ": missing receipt / supporting document ID" for r in state.get("raw_expenses", []) if not r.get("receipt_id")),
     )
 
-    email_status = send_expense_email(
-        receiver_email=state["receiver_email"],
-        pdf_path=pdf_path,
-        employee_name=state["employee_name"],
-        target_month=state["target_month"],
-    )
+    # Jury 2: NEVER send automatically. The email goes out only if the
+    # employee has explicitly confirmed (email_confirmed=True). Otherwise the
+    # report is left "pending" and the UI asks for confirmation.
+    if state.get("email_confirmed"):
+        email_status = send_confirmed_email(
+            receiver_email=state["receiver_email"],
+            pdf_path=pdf_path,
+            employee_name=state["employee_name"],
+            target_month=state["target_month"],
+            demo_mode=state.get("demo_mode", False),
+        )
+    else:
+        email_status = {
+            "success": False,
+            "status": "pending",
+            "message": "Email NOT sent yet — waiting for your explicit confirmation.",
+        }
 
     trace = f"📄 Compiler & Delivery: generated PDF at '{pdf_path}'. "
-    trace += (
-        f"✅ {email_status['message']}"
-        if email_status["success"]
-        else f"❌ {email_status['message']}"
-    )
+    icon = {"sent": "✅", "failed": "❌", "simulated": "🧪", "pending": "⏳"}[email_status["status"]]
+    trace += f"{icon} {email_status['message']}"
 
     return {
         "final_report_md": final_report_md,
@@ -395,3 +432,28 @@ def build_expense_graph():
 # Module-level compiled graph — imported directly by app.py so it's built
 # exactly once per process, not rebuilt on every Streamlit rerun.
 expense_graph = build_expense_graph()
+
+
+def make_initial_state(employee_name, target_month, receiver_email, demo_mode=False) -> dict:
+    """Every ExpenseState key with a safe starting value. Used by both the
+    Streamlit report page and the chat assistant's generate_report tool, so
+    the original workflow is started the same way from either place."""
+    return {
+        "employee_name": employee_name,
+        "target_month": target_month,
+        "receiver_email": receiver_email,
+        "raw_expenses": [],
+        "valid_expenses": [],
+        "missing_expenses": [],
+        "categorized_expenses": [],
+        "category_totals": {},
+        "grand_total": 0.0,
+        "has_missing_data": False,
+        "discrepancy_note": "",
+        "final_report_md": "",
+        "pdf_path": "",
+        "email_status": {},
+        "demo_mode": demo_mode,
+        "email_confirmed": False,   # never auto-send; see compiler_delivery_node
+        "thought_trace": [],
+    }

@@ -15,65 +15,40 @@ which is a handy thing to demonstrate in a viva.
 
 import os
 import smtplib
-from email import encoders, message
+from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from time import time
 
 from fpdf import FPDF
 
 # ---------------------------------------------------------------------------
 # 1. SIMULATED LOCAL DATABASE
 # ---------------------------------------------------------------------------
+# A hardcoded list of dicts standing in for a real receipts database/API
+# (constraint: "No Database APIs"), so the demo never depends on a live
+# connection. NOTE the Taj Hotels row: `amount` is deliberately `None` —
+# that's what guarantees the Anomaly Handler branch is reachable whenever
+# you demo with Aditi Sharma / 2026-07.
+# `receipt_id` is the supporting document reference; the Domino's row has
+# `None` there, so the assistant can also report "missing supporting info".
+# Expense records are stored in SQLite. The database is seeded with synthetic
+# enterprise records by database.py on first startup.
+from database import get_expenses as _db_get_expenses, available_months as _db_available_months
+MOCK_RECEIPTS = []  # retained only for backward-compatible imports
 
-MOCK_RECEIPTS = [
-    # Aditi Sharma - July 2026 (Contains an anomaly)
-    {"employee": "Aditi Sharma", "date": "2026-07-03", "vendor": "IndiGo Airlines", "description": "Flight PNQ-BLR", "amount": 4500.0},
-    {"employee": "Aditi Sharma", "date": "2026-07-03", "vendor": "Cafe Coffee Day", "description": "Client lunch", "amount": 850.0},
-    {"employee": "Aditi Sharma", "date": "2026-07-05", "vendor": "Taj Hotels", "description": "2 nights lodging", "amount": None}, # Anomaly
-    {"employee": "Aditi Sharma", "date": "2026-07-06", "vendor": "Uber", "description": "Airport transfer", "amount": 620.0},
-    {"employee": "Aditi Sharma", "date": "2026-07-10", "vendor": "Domino's Pizza", "description": "Team dinner", "amount": 1200.0},
-    {"employee": "Aditi Sharma", "date": "2026-07-12", "vendor": "WeWork", "description": "Day pass for coworking", "amount": 900.0},
-    
-    # Aditi Sharma - August 2026 (Clean run, no missing data)
-    {"employee": "Aditi Sharma", "date": "2026-08-01", "vendor": "Vistara", "description": "Flight BLR-BOM", "amount": 5100.0},
-    {"employee": "Aditi Sharma", "date": "2026-08-02", "vendor": "Trident Hotel", "description": "1 night stay", "amount": 7500.0},
-    {"employee": "Aditi Sharma", "date": "2026-08-02", "vendor": "Starbucks", "description": "Breakfast meeting", "amount": 650.0},
-    {"employee": "Aditi Sharma", "date": "2026-08-04", "vendor": "Ola Cabs", "description": "City transit", "amount": 450.0},
-
-    # Rohan Mehta - July 2026 (Contains multiple anomalies)
-    {"employee": "Rohan Mehta", "date": "2026-07-08", "vendor": "SpiceJet", "description": "Flight BLR-DEL", "amount": 5200.0},
-    {"employee": "Rohan Mehta", "date": "2026-07-09", "vendor": "The Leela", "description": "1 night lodging", "amount": 6100.0},
-    {"employee": "Rohan Mehta", "date": "2026-07-10", "vendor": "Bukhara", "description": "Client dinner", "amount": None}, # Anomaly
-    {"employee": "Rohan Mehta", "date": "2026-07-11", "vendor": "Meru Cabs", "description": "Hotel to Airport", "amount": None}, # Anomaly
-
-    # Ankit Prasad - July 2026 (Clean run)
-    {"employee": "Ankit Prasad", "date": "2026-07-14", "vendor": "Air India", "description": "Flight DEL-HYD", "amount": 6300.0},
-    {"employee": "Ankit Prasad", "date": "2026-07-15", "vendor": "ITC Kakatiya", "description": "2 nights stay", "amount": 14000.0},
-    {"employee": "Ankit Prasad", "date": "2026-07-16", "vendor": "Paradise Biryani", "description": "Team lunch", "amount": 2100.0},
-    {"employee": "Ankit Prasad", "date": "2026-07-17", "vendor": "Hyderabad Metro", "description": "Transit card recharge", "amount": 500.0}
-]
 
 
 def get_mock_expenses(employee_name: str, target_month: str) -> list:
-    """
-    Simulated "Retrieve expenses" + "Filter date" tool.
+    """Retrieve persistent expense records for an employee and YYYY-MM month."""
+    return _db_get_expenses(employee_name, target_month)
 
-    employee_name: matched case-insensitively against MOCK_RECEIPTS.
-    target_month:  a "YYYY-MM" string, e.g. "2026-07".
 
-    Doing the employee + month filtering here, in plain Python, rather
-    than asking the LLM to filter a list, keeps retrieval 100%
-    deterministic — exactly the kind of task a normal function should do,
-    not something delegated to a language model.
-    """
-    return [
-        receipt
-        for receipt in MOCK_RECEIPTS
-        if receipt["employee"].strip().lower() == employee_name.strip().lower()
-        and receipt["date"].startswith(target_month)
-    ]
+
+def get_available_months(employee_name: str) -> list:
+    """Return months with records for this employee."""
+    return _db_available_months(employee_name)
+
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +60,7 @@ def generate_pdf(
     category_totals: dict,
     grand_total: float,
     discrepancy_note: str = "",
-    output_dir: str = ".",
+    output_dir: str | None = None,
 ) -> str:
     """
     Renders the finished expense report as a real, physical PDF file using
@@ -96,6 +71,9 @@ def generate_pdf(
     Delivery node then hands to send_expense_email() as an attachment and
     to app.py for the Streamlit download button.
     """
+    if output_dir is None:
+        output_dir = os.path.join(os.path.dirname(__file__), "data", "generated_reports")
+    os.makedirs(output_dir, exist_ok=True)
     pdf = FPDF()
     pdf.add_page()
 
@@ -126,19 +104,7 @@ def generate_pdf(
         pdf.cell(0, 8, "Flagged for Review", ln=True)
         pdf.set_font("Helvetica", "", 10)
         pdf.set_text_color(0, 0, 0)
-        
-        # Sanitize LLM text to prevent FPDF Unicode crashes
-        clean_note = (
-            discrepancy_note.replace(" ", " ")
-            .replace("—", "-")
-            .replace("’", "'")
-            .replace("“", '"')
-            .replace("”", '"')
-        )
-        # Strip any remaining unsupported characters silently
-        clean_note = clean_note.encode('latin-1', 'ignore').decode('latin-1')
-        
-        pdf.multi_cell(0, 6, clean_note)
+        pdf.multi_cell(0, 6, discrepancy_note)
 
     safe_name = employee_name.strip().replace(" ", "_")
     filename = f"expense_report_{safe_name}_{target_month}.pdf"
@@ -187,15 +153,15 @@ def send_expense_email(
         message = MIMEMultipart()
         message["From"] = sender_email
         message["To"] = receiver_email
-        import time
-        current_time = time.strftime("%H:%M:%S")
-        message["Subject"] = f"Travel Expense Report — {employee_name} ({target_month}) [Run: {current_time}]"
+        message["Subject"] = f"Travel Expense Report — {employee_name} — {target_month}"
 
+        # Fixed professional template; only employee and reporting month vary.
         body = (
-            f"Hi Finance team,\n\n"
-            f"Please find attached the travel expense report for "
-            f"{employee_name}, covering {target_month}.\n\n"
-            f"Regards,\n{employee_name} (sent by Autonomous Expense Agent)"
+            "Dear Finance Team,\n\n"
+            f"Please find attached the travel expense report for {employee_name} for {target_month}.\n\n"
+            "Please review the attached report and follow the standard expense-processing procedure. "
+            "Any items marked 'Needs Review' require verification of the supporting information.\n\n"
+            "Kind regards,\nExpense Operations"
         )
         message.attach(MIMEText(body, "plain"))
 
@@ -218,3 +184,36 @@ def send_expense_email(
 
     except Exception as exc:  # noqa: BLE001 — intentionally broad for demo safety
         return {"success": False, "message": f"Email send failed: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# 4. CONFIRMED DELIVERY (Jury 2)
+# ---------------------------------------------------------------------------
+def send_confirmed_email(
+    receiver_email: str,
+    pdf_path: str,
+    employee_name: str,
+    target_month: str,
+    demo_mode: bool = False,
+) -> dict:
+    """
+    The ONLY place the app triggers an email, and it is only ever called
+    after the employee explicitly confirms (button click or typing "yes").
+
+    - demo_mode=True  -> nothing is sent; we return an honest "simulated"
+                         result so the demo works offline / without
+                         credentials and never claims a real send.
+    - demo_mode=False -> calls the real Gmail SMTP sender above.
+
+    Always returns {"success": bool, "status": "sent"|"failed"|"simulated",
+    "message": str} so the UI can show the true outcome.
+    """
+    if demo_mode:
+        return {
+            "success": False,
+            "status": "simulated",
+            "message": f"Demo mode: email to {receiver_email} was NOT actually sent (simulated).",
+        }
+    result = send_expense_email(receiver_email, pdf_path, employee_name, target_month)
+    result["status"] = "sent" if result["success"] else "failed"
+    return result

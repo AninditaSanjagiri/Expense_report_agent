@@ -14,3 +14,8 @@ python-dotenv>=1.0.0        # loads GROQ_API_KEY / SENDER_EMAIL / etc. from .env
 
 # Note: smtplib and email.mime (used for sending the report) are part of
 # the Python standard library, so they need no entry here.
+
+# React app API backend
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.0

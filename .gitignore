@@ -1,23 +1,11 @@
-
-# Environment variables and secrets
-.env
-.env.*
-!.env.example
-
-# Python
-__pycache__/
-*.py[cod]
 .venv/
-venv/
-
-# Generated expense reports
-expense_report_*.pdf
-
-# Streamlit
-.streamlit/secrets.toml
-
-# IDE and OS files
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
+__pycache__/
+*.pyc
+.env
+data/expenses.db
+data/generated_reports/*
+!data/generated_reports/.gitkeep
+frontend/node_modules/
+frontend/dist/
+*.pdf
+*.tsbuildinfo
